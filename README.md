@@ -55,3 +55,37 @@ RUNPOD_INVOKE_URL=https://api.runpod.ai/v2
 Keep `workersMin` at 0. The studio's kill switch (`services/api/killswitch.py`,
 `scripts/killswitch.sh`, or Settings → GPU kill switch) scales the endpoint to
 zero and purges the queue in one call.
+
+## Live deployment (verified)
+
+| Thing | Value |
+|---|---|
+| Image | `ghcr.io/kdee82/dml-runpod-i2v:1.1.0` (torch 2.6.0+cu124, diffusers 0.42) |
+| Template | `ryrxfhm69b` — boots `handler.py` from this repo at container start |
+| Endpoint | `re69tvql9fj1m4` (`DML-Motion-Studio-I2V-v4`), RTX 4090, `workersMin: 0` |
+| Registry auth | Runpod GraphQL `saveRegistryAuth` → `ghcr-kdee82` (REST has no such route) |
+
+**Verified render:** 832×480, 57 frames, 1.9 s, 114 s GPU execution.
+
+Hot-loading the handler means prompt/model/memory changes need only a
+`git push` — the next cold start picks them up. Only dependency or torch
+changes require a rebuild.
+
+## Traps that cost real debugging time
+
+- **`diffusers>=0.35` requires `torch>=2.6`** (`torch.accelerator`). On torch
+  2.4 the handler dies on import, the worker still reports "ready", and every
+  job sits in `IN_QUEUE` forever. The Dockerfile now imports the stack at build
+  time so this fails the build instead.
+- **Cloudflare fingerprint-blocks Python's TLS stack.** `urllib` gets
+  `404 page not found` on `/run` for the same URL that returns `200` from curl.
+  Send requests with curl.
+- **Never pass image base64 as an argv entry** — it exceeds ARG_MAX
+  ("Argument list too long"). Pipe the JSON on stdin (`curl --data-binary @-`).
+- **24 GB is the limit at 720p.** Use `enable_model_cpu_offload()` + VAE
+  tiling/slicing and cap to ~480p; default `MAX_PIXELS` reflects that.
+- **Template edits do not reach a running endpoint.** Create a new endpoint
+  (or bump versions) after changing image or start command.
+- **No network volume means a ~32 GB re-download per cold start.** Attach a
+  volume to make warm starts fast and stop paying GPU time for downloads.
+
