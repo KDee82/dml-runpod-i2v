@@ -35,7 +35,7 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/kdee82/dml-runpod-i2v:1.0.0
+            ghcr.io/kdee82/dml-runpod-i2v:1.2.0
             ghcr.io/kdee82/dml-runpod-i2v:latest
 
       # Runpod pulls anonymously, so the package must be public.

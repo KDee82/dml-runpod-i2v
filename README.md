@@ -41,6 +41,27 @@ message verbatim. No silent successes.
   network volume to make cold starts fast; without one, expect a long first pull.
 - The pipeline is cached per worker and reused across jobs.
 
+## Face restoration
+
+A 5B model at 480p has no facial conditioning, so faces drift and melt across a
+shot. After generation, each frame's faces are detected with facexlib, restored
+with GFPGAN and pasted back inside a feathered mask — only the face boxes change,
+the rest of the frame is byte-identical. Motion, identity and framing are
+untouched; this repairs structure, it does not add resolution.
+
+| Env | Default | Meaning |
+| --- | --- | --- |
+| `FACE_RESTORE` | `1` | `0` disables the pass entirely |
+| `FACE_MIN_PX` | `40` | faces smaller than this are skipped (too small to repair) |
+| `FACE_STRENGTH` | `1.0` | 0–1 blend inside the face mask; lower it if faces look plastic |
+| `GFPGAN_MODEL_PATH` | `/opt/gfpgan/GFPGANv1.4.pth` | baked into the image |
+
+The pass is fail-open: a missing library, an OOM or a bad frame leaves the
+generated frame untouched and reports it in `meta.face_restore` instead of
+failing the render.
+
+`python3 tests/test_face_pass.py` runs the logic offline (no GPU, no weights).
+
 ## Deploy
 
 Runpod builds this repository directly. Create a **serverless** template from
