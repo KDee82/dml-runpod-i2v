@@ -134,5 +134,29 @@ out_boom, stats_boom = handler.restore_faces([frame(), frame()])
 check("per-frame failure keeps frames", all(tuple(np.array(f)[170, 160]) == (128, 128, 128) for f in out_boom))
 check("per-frame failures counted", stats_boom.get("errors") == 2, str(stats_boom))
 
+print("face pass: pipeline returns a numpy batch")
+# Wan returns (n, h, w, 3) floats in [0, 1] — not a list of PIL images.
+handler.FACE_RESTORE = True
+handler.FACE_STRENGTH = 1.0
+handler._RESTORE_ERR = None
+handler._RESTORER = FakeRestorer([])  # no faces: must pass through untouched
+arr = np.zeros((2, 48, 64, 3), dtype=np.float32)
+arr[..., 0] = 1.0
+out_np, stats_np = handler.restore_faces(arr)
+check("numpy batch -> PIL frames", len(out_np) == 2 and isinstance(out_np[0], Image.Image),
+      str(type(out_np[0]) if out_np else None))
+check("float [0,1] scaled to 0..255", tuple(np.array(out_np[0])[5, 5]) == (255, 0, 0),
+      str(tuple(np.array(out_np[0])[5, 5])))
+check("numpy batch reports frame count", stats_np["frames"] == 2, str(stats_np))
+
+handler._RESTORER = FakeRestorer([[4, 4, 44, 44]])  # 40px face: at FACE_MIN_PX
+out_u8, _ = handler.restore_faces(np.full((1, 64, 64, 3), 128, dtype=np.uint8))
+# the feathered mask bleeds a hair at the corner, so allow 3/255 of tint
+px_corner = np.array(out_u8[0])[62, 62].astype(int)
+check("uint8 batch keeps scale (outside face)", int(abs(px_corner - 128).max()) <= 3,
+      str(tuple(px_corner)))
+check("uint8 batch face restored", tuple(np.array(out_u8[0])[24, 24]) == (255, 0, 0),
+      str(tuple(np.array(out_u8[0])[24, 24])))
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 sys.exit(1 if FAIL else 0)

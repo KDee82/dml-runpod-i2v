@@ -121,12 +121,38 @@ def get_restorer():
         return None
 
 
+def _as_pil_frames(frames):
+    """Normalise pipeline output to a list of PIL RGB images.
+
+    diffusers hands back either a list of PIL images or an (n, h, w, 3) numpy
+    array, depending on pipeline and version — Wan returns the array, and
+    treating that as a list-of-images is what broke the first live render.
+    """
+    import numpy as np
+    from PIL import Image
+
+    def one(f):
+        if not isinstance(f, np.ndarray):
+            return f
+        if f.dtype != np.uint8:
+            f = f.astype(np.float32)
+            if f.max() <= 1.0:  # postprocess_video returns floats in [0, 1]
+                f = f * 255.0
+            f = np.clip(f, 0, 255).round().astype(np.uint8)
+        return Image.fromarray(f)
+
+    if isinstance(frames, np.ndarray):
+        return [one(f) for f in (frames[None] if frames.ndim == 3 else frames)]
+    return [one(f) for f in frames]
+
+
 def restore_faces(frames):
     """Repair faces in generated frames. Returns (frames, stats).
 
     Frames with no face, or only faces below FACE_MIN_PX, come back untouched,
     so the rest of the shot is never altered by this pass.
     """
+    frames = _as_pil_frames(frames)
     stats = {"enabled": FACE_RESTORE, "restored": 0, "frames": len(frames)}
     if not frames or not FACE_RESTORE:
         return frames, stats
