@@ -34,14 +34,19 @@ jobs:
         with:
           context: .
           push: true
+          # ghcr.io/kdee82/dml-runpod-i2v is owned by a package this repo is not
+          # linked to, so GITHUB_TOKEN cannot push to it. This package is created
+          # by this workflow, which makes the repo its owner.
           tags: |
-            ghcr.io/kdee82/dml-runpod-i2v:1.2.0
-            ghcr.io/kdee82/dml-runpod-i2v:latest
+            ghcr.io/kdee82/dml-i2v-face:1.2.0
+            ghcr.io/kdee82/dml-i2v-face:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       # Runpod pulls anonymously, so the package must be public.
       - name: Publish package visibility
         run: |
-          for pkg in dml-runpod-i2v; do
+          for pkg in dml-i2v-face; do
             curl -sS -X PATCH \
               -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
               -H "Accept: application/vnd.github+json" \
