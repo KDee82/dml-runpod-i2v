@@ -38,7 +38,7 @@ jobs:
           # linked to, so GITHUB_TOKEN cannot push to it. This package is created
           # by this workflow, which makes the repo its owner.
           tags: |
-            ghcr.io/kdee82/dml-i2v-face:1.2.0
+            ghcr.io/kdee82/dml-i2v-face:1.2.1
             ghcr.io/kdee82/dml-i2v-face:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
