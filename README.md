@@ -49,12 +49,25 @@ with GFPGAN and pasted back inside a feathered mask — only the face boxes chan
 the rest of the frame is byte-identical. Motion, identity and framing are
 untouched; this repairs structure, it does not add resolution.
 
+Every frame after the first usable one is additionally pulled onto that
+frame's canonical aligned face (temporal identity anchor): the first face
+crop is warped back into each later frame's face position through
+facexlib's affine matrices and blended inside a feathered face oval, so
+GFPGAN's per-frame normalization cannot invent a different person late in
+the shot. `meta.face_restore` reports `restored / anchored / anchor_frame /
+anchor_weight / errors` in every job.
+
 | Env | Default | Meaning |
 | --- | --- | --- |
 | `FACE_RESTORE` | `1` | `0` disables the pass entirely |
 | `FACE_MIN_PX` | `40` | faces smaller than this are skipped (too small to repair) |
 | `FACE_STRENGTH` | `1.0` | 0–1 blend inside the face mask; lower it if faces look plastic |
-| `GFPGAN_MODEL_PATH` | `/opt/gfpgan/GFPGANv1.4.pth` | baked into the image |
+| `FACE_ANCHOR` | `0.65` | 0–1 identity-anchor weight; `0` = per-frame GFPGAN only |
+| `GFPGAN_MODEL_PATH` | `/opt/gfpgan/GFPGANv1.4.pth` | baked into the image; http(s) URLs are downloaded once and cached |
+| `TORCH_DTYPE` | `bfloat16` | `float16` for T4-class GPUs (Turing has no native bf16) |
+
+Jobs may override `face_anchor` / `face_strength` per request; env values are
+the defaults.
 
 The pass is fail-open: a missing library, an OOM or a bad frame leaves the
 generated frame untouched and reports it in `meta.face_restore` instead of
