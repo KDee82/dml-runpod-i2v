@@ -13,10 +13,12 @@ capped, otherwise 720p overruns 24 GB ("CUDA out of memory").
 Face pass (optional): a 5B model at 480p has no facial conditioning, so faces
 drift and melt over a shot. After generation each frame's faces are detected,
 restored with GFPGAN and pasted back, which repairs structure without touching
-motion, identity or the rest of the frame. On top of that, every frame after
-the first usable one is pulled toward that frame's canonical aligned face
-(temporal identity anchor), so GFPGAN's per-frame "average face" cannot invent
-a different person late in the shot. Disable with FACE_RESTORE=0; anchor
+motion, identity or the rest of the frame. On top of that, the uploaded
+reference photo's face is the canonical identity anchor: every generated frame
+(frame 0 included) is pulled toward the restored aligned face taken from that
+photo, so neither Wan nor GFPGAN's per-frame "average face" can invent a
+different person. If the reference has no detectable face, the first generated
+usable frame seeds the anchor instead. Disable with FACE_RESTORE=0; anchor
 weight with FACE_ANCHOR / per-request face_anchor.
 """
 import base64
@@ -52,9 +54,10 @@ FACE_RESTORE = os.environ.get("FACE_RESTORE", "1").lower() in ("1", "true", "yes
 FACE_MIN_PX = int(os.environ.get("FACE_MIN_PX", "40"))
 # 1.0 = full restoration. Lower it if faces start looking too smoothed/plastic.
 FACE_STRENGTH = float(os.environ.get("FACE_STRENGTH", "1.0"))
-# Weight of the temporal identity anchor: how strongly every frame after the
-# first usable one is pulled onto that first canonical face. 0 = off (each
-# frame keeps GFPGAN's own per-frame result); 0.65 is the studio default.
+# Weight of the identity anchor: how strongly every generated frame is pulled
+# onto the uploaded reference photo's face (or, with no usable face in that
+# photo, onto the first generated usable frame). 0 = off (each frame keeps
+# GFPGAN's own per-frame result); 0.65 is the studio default.
 FACE_ANCHOR = float(os.environ.get("FACE_ANCHOR", "0.65"))
 GFPGAN_MODEL_PATH = os.environ.get(
     "GFPGAN_MODEL_PATH",
@@ -228,23 +231,85 @@ def _feathered_oval_mask(size, box, feather_px):
     return mask.filter(ImageFilter.GaussianBlur(max(2, int(feather_px))))
 
 
-def restore_faces(frames, anchor=None, strength=None):
+def _enhance_frame(restorer, rgb):
+    """Run the restorer on one RGB image (a generated frame or the reference).
+
+    Returns (restored_full_bgr, usable) where usable pairs every face big
+    enough to repair with its aligned restored crop:
+    [(box, affine_or_None, aligned_crop), ...]. Detection and alignment read
+    facexlib's real attributes (see _detect_boxes), so this works for the
+    reference photo and for generated frames alike.
+    """
+    import cv2
+    import numpy as np
+
+    _, aligned_restored, restored = restorer.enhance(
+        cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+        has_aligned=False, only_center_face=False, paste_back=True)
+    helper = getattr(restorer, "face_helper", None)
+    boxes = _detect_boxes(helper) if helper is not None else []
+    affines = list(getattr(helper, "affine_matrices", None) or [])
+    usable = []
+    for j, aligned in enumerate(aligned_restored or []):
+        if aligned is None or j >= len(boxes):
+            break  # boxes must pair with the aligned crops
+        b = boxes[j]
+        if (b[2] - b[0]) >= FACE_MIN_PX and (b[3] - b[1]) >= FACE_MIN_PX:
+            affine = (np.asarray(affines[j], dtype=np.float32).reshape(2, 3)
+                      if j < len(affines) else None)
+            usable.append((b, affine, np.asarray(aligned)))
+    return restored, usable
+
+
+def _reference_anchor_crop(restorer, reference_image):
+    """Canonical anchor crop from the uploaded reference photo, or None.
+
+    The reference is the identity the shot is supposed to keep, so it goes
+    through the same restorer as the frames and its largest usable face is
+    the anchor outright. A generated frame is only a fallback for when
+    nothing here can be repaired.
+    """
+    try:
+        import numpy as np
+
+        _, usable = _enhance_frame(
+            restorer, np.array(reference_image.convert("RGB")))
+    except Exception as e:  # noqa: BLE001 - fail open onto the first-frame anchor
+        print(f"[worker] reference face anchor failed: {type(e).__name__}: {e}",
+              flush=True)
+        return None
+    if not usable:
+        return None
+    _, _, crop = max(
+        usable, key=lambda u: (u[0][2] - u[0][0]) * (u[0][3] - u[0][1]))
+    return crop
+
+
+def restore_faces(frames, anchor=None, strength=None, reference_image=None):
     """Repair faces in generated frames. Returns (frames, stats).
 
     Frames with no face, or only faces below FACE_MIN_PX, come back untouched,
     so the rest of the shot is never altered by this pass.
 
-    anchor: 0-1 weight pulling every frame after the first usable one onto
-    that frame's canonical aligned face (0 = each frame keeps GFPGAN's own
-    per-frame result). strength: 0-1 blend of the restored face inside the
-    face mask. Per-request values override the env defaults (FACE_ANCHOR /
-    FACE_STRENGTH) so the studio can turn the knob per job.
+    reference_image: the cover-cropped uploaded photo (PIL RGB). When it has a
+    usable face, its largest restored aligned face is the canonical identity
+    anchor and EVERY generated frame — frame 0 included — is pulled onto it,
+    so the shot keeps the uploaded person instead of whatever Wan invented on
+    frame 0. Without one (or with no face in it) the first generated frame
+    with a usable face seeds the anchor as before, and frames before it keep
+    GFPGAN's own result.
+
+    anchor: 0-1 weight of the identity-anchor blend (0 = each frame keeps
+    GFPGAN's own per-frame result). strength: 0-1 blend of the restored face
+    inside the face mask. Per-request values override the env defaults
+    (FACE_ANCHOR / FACE_STRENGTH) so the studio can turn the knob per job.
     """
     frames = _as_pil_frames(frames)
     anchor_w = FACE_ANCHOR if anchor is None else min(1.0, max(0.0, float(anchor)))
     strength_w = FACE_STRENGTH if strength is None else min(1.0, max(0.0, float(strength)))
     stats = {"enabled": FACE_RESTORE, "restored": 0, "anchored": 0,
-             "anchor_frame": None, "anchor_weight": anchor_w, "errors": 0,
+             "anchor_frame": None, "anchor_source": None,
+             "anchor_weight": anchor_w, "errors": 0,
              "frames": len(frames)}
     if not frames or not FACE_RESTORE:
         stats["enabled"] = False
@@ -263,16 +328,22 @@ def restore_faces(frames, anchor=None, strength=None):
         pass
 
     out = []
-    anchor_crop = None          # aligned restored BGR crop of the first usable face
+    anchor_crop = None          # aligned restored BGR crop of the canonical face
     anchor_frame = None
+    anchor_source = None
     feather = max(2, FACE_MIN_PX // 8)
+
+    # The uploaded photo defines identity, so it is resolved BEFORE the frame
+    # loop: frame 0 is then pulled onto the reference instead of becoming it.
+    if reference_image is not None:
+        anchor_crop = _reference_anchor_crop(restorer, reference_image)
+        if anchor_crop is not None:
+            anchor_source, anchor_frame = "reference", "reference"
 
     for i, im in enumerate(frames):
         rgb = np.array(im.convert("RGB"))
         try:
-            _, aligned_restored, restored = restorer.enhance(
-                cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
-                has_aligned=False, only_center_face=False, paste_back=True)
+            restored, usable = _enhance_frame(restorer, rgb)
         except Exception as e:  # noqa: BLE001 - one bad frame must not kill the job
             stats["errors"] += 1
             if stats["errors"] == 1:
@@ -281,18 +352,6 @@ def restore_faces(frames, anchor=None, strength=None):
             out.append(im)
             continue
 
-        helper = getattr(restorer, "face_helper", None)
-        boxes = _detect_boxes(helper) if helper is not None else []
-        affines = list(getattr(helper, "affine_matrices", None) or [])
-        usable = []
-        for j, aligned in enumerate(aligned_restored or []):
-            if aligned is None or j >= len(boxes):
-                break  # boxes must pair with the aligned crops
-            b = boxes[j]
-            if (b[2] - b[0]) >= FACE_MIN_PX and (b[3] - b[1]) >= FACE_MIN_PX:
-                affine = (np.asarray(affines[j], dtype=np.float32).reshape(2, 3)
-                          if j < len(affines) else None)
-                usable.append((b, affine, np.asarray(aligned)))
         if restored is None or not usable:
             out.append(im)  # no usable face: keep the generated frame as-is
             continue
@@ -304,14 +363,19 @@ def restore_faces(frames, anchor=None, strength=None):
             fixed, im.convert("RGB"),
             _feathered_rect_mask(im.size, [b for b, _, _ in usable], strength_w, feather))
 
+        seeded = False
         if anchor_crop is None:
-            # First usable frame: it IS the canonical identity for this job.
+            # No reference face: the first usable frame IS the canonical
+            # identity for this job (it cannot be pulled onto itself).
             anchor_crop, anchor_frame = usable[0][2], i
-        elif anchor_w > 0:
-            # Later frames: warp the canonical face back into every usable
-            # face position through that frame's affine, blend at anchor_w
-            # inside a feathered oval. Legacy helpers without affines still
-            # get the GFPGAN paste-back above — the anchor just can't warp.
+            anchor_source = "first_frame"
+            seeded = True
+        if not seeded and anchor_w > 0:
+            # Every usable frame (frame 0 included when the reference anchored
+            # this job): warp the canonical face back into each face position
+            # through that frame's affine, blend at anchor_w inside a
+            # feathered oval. Legacy helpers without affines still get the
+            # GFPGAN paste-back above — the anchor just can't warp.
             base_rgb = cv2.cvtColor(restored, cv2.COLOR_BGR2RGB).astype(np.float32)
             blended = False
             for box, affine, _ in usable:
@@ -337,6 +401,7 @@ def restore_faces(frames, anchor=None, strength=None):
         stats["restored"] += 1
 
     stats["anchor_frame"] = anchor_frame
+    stats["anchor_source"] = anchor_source
     return out, stats
 
 
@@ -407,7 +472,8 @@ def handler(job):
 
         face_t0 = time.time()
         out, face_stats = restore_faces(
-            out, anchor=inp.get("face_anchor"), strength=inp.get("face_strength"))
+            out, anchor=inp.get("face_anchor"), strength=inp.get("face_strength"),
+            reference_image=img)
         if face_stats.get("restored"):
             face_stats["seconds"] = round(time.time() - face_t0, 1)
         try:

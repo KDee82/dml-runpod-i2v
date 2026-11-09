@@ -12,7 +12,9 @@ Covers detection read, legacy attribute fallback, anchor on/off/partial,
 per-request override, per-frame failures, numpy batches and the URL model
 path. No GPU, no weights, no network beyond localhost.
 """
+import base64
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -105,14 +107,48 @@ class FakeRestorer:
     def __init__(self, det_faces=None, affines=None, legacy_boxes=None):
         self.face_helper = FakeFaceHelper(det_faces, affines, legacy_boxes)
 
+    def _crop_fill(self, bgr):
+        """BGR colour of one restored aligned crop (red by default)."""
+        return (0, 0, 255)
+
+    def _crops(self, bgr):
+        helper = self.face_helper
+        n = len(helper.affine_matrices) if helper.affine_matrices \
+            else len(helper.det_faces or helper.face_bboxes or [])
+        crop = np.zeros((self.CROP, self.CROP, 3), dtype=np.uint8)
+        crop[:] = self._crop_fill(bgr)
+        return [crop] * n
+
     def enhance(self, bgr, **kw):
         out = bgr.copy()
         out[:] = (0, 255, 0)  # BGR green
-        anchored_crop = np.zeros((self.CROP, self.CROP, 3), dtype=np.uint8)
-        anchored_crop[:] = (0, 0, 255)  # BGR red
-        n = len(self.face_helper.affine_matrices) if self.face_helper.affine_matrices \
-            else len(self.face_helper.det_faces or self.face_helper.face_bboxes or [])
-        return None, [anchored_crop] * n, out
+        return None, self._crops(bgr), out
+
+
+class ColourRestorer(FakeRestorer):
+    """Aligned crops take the input's top-left pixel colour.
+
+    Reference photo and generated frames then stay distinguishable in the
+    output, which is what the reference-anchor tests need.
+    """
+
+    def _crop_fill(self, bgr):
+        return tuple(int(v) for v in bgr[0, 0])
+
+
+class PolicyRestorer(ColourRestorer):
+    """Detection chosen per image, so the reference can be face-free."""
+
+    def __init__(self, faces_for):
+        super().__init__()
+        self._faces_for = faces_for
+
+    def enhance(self, bgr, **kw):
+        boxes = [list(b) for b in self._faces_for(bgr)]
+        self.face_helper.det_faces = ([b + [0.99] for b in boxes] or None)
+        self.face_helper.affine_matrices = (
+            [frame_to_crop_affine(b) for b in boxes] or None)
+        return super().enhance(bgr, **kw)
 
 
 def setup(det_faces=None, affines=None, legacy=None):
@@ -129,7 +165,9 @@ h_in = frame()
 out, stats = handler.restore_faces([h_in])
 check("disabled returns same frames", out[0] is h_in)
 check("disabled reports enabled=False", stats["enabled"] is False)
-check("disabled keeps stats shape", stats.get("frames") == 1 and "anchor_weight" in stats, str(stats))
+check("disabled keeps stats shape",
+      stats.get("frames") == 1 and "anchor_weight" in stats
+      and "anchor_source" in stats and stats["anchor_source"] is None, str(stats))
 
 print("face pass: library missing")
 handler.FACE_RESTORE = True
@@ -310,6 +348,186 @@ try:
           isinstance(res, dict) and bool(res.get("error")), str(res)[:120])
 except Exception as e:  # noqa: BLE001 - handler must not raise past its boundary
     check("handler surfaces bad input as error, never silently", False, repr(e))
+
+print("face pass: reference photo is the identity anchor")
+REF_IMG = Image.new("RGB", (832, 480), (255, 0, 0))  # red reference; frames are grey
+
+
+def _is_reference(bgr):
+    return tuple(int(v) for v in bgr[0, 0]) == (0, 0, 255)  # BGR of the red photo
+
+
+setup(det_faces=[BOX + [0.95]], affines=[frame_to_crop_affine(BOX)])
+handler._RESTORER = ColourRestorer(det_faces=[BOX + [0.95]],
+                                   affines=[frame_to_crop_affine(BOX)])
+out_ref, stats_ref = handler.restore_faces([frame(), frame()], reference_image=REF_IMG)
+px0 = np.array(out_ref[0])[170, 160]
+check("reference anchor reaches generated frame 0",
+      abs(int(px0[0]) - 166) <= 6 and abs(int(px0[1]) - 89) <= 6 and int(px0[2]) <= 6,
+      str(tuple(px0)))
+px1 = np.array(out_ref[1])[170, 160]
+check("reference anchor reaches later frames",
+      abs(int(px1[0]) - 166) <= 6 and abs(int(px1[1]) - 89) <= 6 and int(px1[2]) <= 6,
+      str(tuple(px1)))
+check("reference anchor wins over frame 0 (frame 0 is not pure GFPGAN)",
+      tuple(int(v) for v in px0) != (0, 255, 0), str(tuple(px0)))
+check("reference anchor reports anchor_source=reference",
+      stats_ref["anchor_source"] == "reference", str(stats_ref))
+check("reference anchor_frame is not misreported as a generated index",
+      stats_ref["anchor_frame"] == "reference"
+      and not isinstance(stats_ref["anchor_frame"], int), repr(stats_ref["anchor_frame"]))
+check("every usable frame is counted as anchored",
+      stats_ref["anchored"] == 2 and stats_ref["restored"] == 2, str(stats_ref))
+
+print("face pass: anchor 0 with a reference keeps per-frame faces")
+handler._RESTORER = ColourRestorer(det_faces=[BOX + [0.95]],
+                                   affines=[frame_to_crop_affine(BOX)])
+out_z, stats_z = handler.restore_faces([frame(), frame()], anchor=0.0,
+                                       reference_image=REF_IMG)
+check("anchor 0 keeps both frames' GFPGAN faces",
+      tuple(int(v) for v in np.array(out_z[0])[170, 160]) == (0, 255, 0)
+      and tuple(int(v) for v in np.array(out_z[1])[170, 160]) == (0, 255, 0),
+      str(stats_z))
+check("anchor 0 still reports the reference source",
+      stats_z["anchor_source"] == "reference" and stats_z["anchor_weight"] == 0.0,
+      str(stats_z))
+
+print("face pass: reference without a usable face falls back to frame 0")
+handler._RESTORER = PolicyRestorer(lambda bgr: [] if _is_reference(bgr) else [BOX])
+out_fb, stats_fb = handler.restore_faces([frame(), frame()], reference_image=REF_IMG)
+check("fallback still restores the frames",
+      stats_fb["restored"] == 2 and stats_fb["errors"] == 0, str(stats_fb))
+check("fallen-back frame 0 keeps GFPGAN face",
+      tuple(int(v) for v in np.array(out_fb[0])[170, 160]) == (0, 255, 0),
+      str(tuple(np.array(out_fb[0])[170, 160])))
+px_fb = np.array(out_fb[1])[170, 160]
+# frame-0 crop is grey (128,128,128) blended 0.65 over GFPGAN green (0,255,0)
+check("fallback anchors later frames to frame 0 (grey crop, not red)",
+      abs(int(px_fb[0]) - 83) <= 6 and abs(int(px_fb[1]) - 172) <= 6
+      and abs(int(px_fb[2]) - 83) <= 6, str(tuple(px_fb)))
+check("fallback reports first_frame / generated index 0",
+      stats_fb["anchor_source"] == "first_frame" and stats_fb["anchor_frame"] == 0,
+      str(stats_fb))
+
+print("face pass: too-small reference face does not anchor")
+SMALL = [10, 10, 30, 30]
+handler._RESTORER = PolicyRestorer(
+    lambda bgr: [SMALL] if _is_reference(bgr) else [BOX])
+out_sm, stats_sm = handler.restore_faces([frame(), frame()], reference_image=REF_IMG)
+check("small reference face falls back to first_frame",
+      stats_sm["anchor_source"] == "first_frame" and stats_sm["anchor_frame"] == 0,
+      str(stats_sm))
+check("small reference face still restores frames", stats_sm["restored"] == 2, str(stats_sm))
+
+print("face pass: anchor source with no reference photo")
+setup(det_faces=[BOX + [0.9]], affines=[frame_to_crop_affine(BOX)])
+out_nr, stats_nr = handler.restore_faces([frame(), frame()])
+check("no reference_image -> first_frame source",
+      stats_nr["anchor_source"] == "first_frame" and stats_nr["anchor_frame"] == 0,
+      str(stats_nr))
+handler._RESTORER = PolicyRestorer(lambda bgr: [])
+out_nf, stats_nf = handler.restore_faces([frame()], reference_image=REF_IMG)
+check("no usable face anywhere -> anchor_source None",
+      stats_nf["anchor_source"] is None and stats_nf["anchor_frame"] is None, str(stats_nf))
+
+print("face pass: reference restore failure fails open")
+
+
+class RefBoom(ColourRestorer):
+    def enhance(self, bgr, **kw):
+        if _is_reference(bgr):
+            raise RuntimeError("reference OOM")
+        return super().enhance(bgr, **kw)
+
+
+handler._RESTORER = RefBoom(det_faces=[BOX + [0.9]],
+                            affines=[frame_to_crop_affine(BOX)])
+out_rb, stats_rb = handler.restore_faces([frame(), frame()], reference_image=REF_IMG)
+check("reference failure does not fail the job",
+      stats_rb["restored"] == 2 and not stats_rb.get("error"), str(stats_rb))
+check("reference failure is not counted as a frame error",
+      stats_rb["errors"] == 0, str(stats_rb))
+check("reference failure falls back to first_frame",
+      stats_rb["anchor_source"] == "first_frame" and stats_rb["anchor_frame"] == 0,
+      str(stats_rb))
+
+print("face pass: reference anchors frames even when generated frame 0 has no face")
+DARK = (64, 64, 64)
+
+
+def _faces(bgr):
+    if tuple(int(v) for v in bgr[0, 0]) == DARK:
+        return []  # dark frame 0: nothing detectable
+    return [BOX]
+
+
+handler._RESTORER = PolicyRestorer(_faces)
+out_d, stats_d = handler.restore_faces([frame(colour=DARK), frame()],
+                                       reference_image=REF_IMG)
+check("faceless generated frame 0 is left untouched",
+      tuple(int(v) for v in np.array(out_d[0])[170, 160]) == DARK,
+      str(tuple(np.array(out_d[0])[170, 160])))
+px_d = np.array(out_d[1])[170, 160]
+check("frame 1 still anchored to the reference, not to frame 0",
+      abs(int(px_d[0]) - 166) <= 6 and abs(int(px_d[1]) - 89) <= 6 and int(px_d[2]) <= 6,
+      str(tuple(px_d)))
+check("faceless frame 0 is not counted as restored/anchored",
+      stats_d["restored"] == 1 and stats_d["anchored"] == 1
+      and stats_d["anchor_source"] == "reference", str(stats_d))
+
+print("face pass: handler passes the cover-cropped reference photo")
+seen = {}
+
+
+class _FakePipe:
+    def __call__(self, **kw):
+        return types.SimpleNamespace(frames=[[frame((64, 48)), frame((64, 48))]])
+
+
+def _fake_restore(frames, anchor=None, strength=None, reference_image=None):
+    seen["reference_image"] = reference_image
+    seen["anchor"] = anchor
+    seen["strength"] = strength
+    return frames, {"enabled": True, "restored": 0, "anchored": 0,
+                    "anchor_frame": None, "anchor_source": None,
+                    "anchor_weight": 0.65, "errors": 0, "frames": len(frames)}
+
+
+def _fake_export(out, path, fps=None):
+    with open(path, "wb") as f:
+        f.write(b"fake video")
+
+
+saved = {name: getattr(handler, name)
+         for name in ("get_pipe", "export_to_video", "restore_faces")}
+handler.get_pipe = lambda: _FakePipe()
+handler.export_to_video = _fake_export
+handler.restore_faces = _fake_restore
+_buf = io.BytesIO()
+Image.new("RGB", (1000, 400), (255, 0, 0)).save(_buf, format="PNG")
+_job = {"input": {"image_b64": base64.b64encode(_buf.getvalue()).decode(),
+                  "face_anchor": 0.65, "face_strength": 1.0,
+                  "aspect_ratio": "9:16", "duration_seconds": 1, "fps": 8}}
+try:
+    _res = handler.handler(_job)
+finally:
+    for _name, _fn in saved.items():
+        setattr(handler, _name, _fn)
+check("handler succeeds with a stubbed pipeline",
+      isinstance(_res, dict) and bool(_res.get("video_b64")) and not _res.get("error"),
+      str(_res)[:160])
+_ref = seen.get("reference_image")
+check("handler passes a PIL reference to restore_faces",
+      isinstance(_ref, Image.Image), str(type(_ref)))
+check("reference is the cover-cropped target frame",
+      _ref is not None and _res.get("meta", {}).get("width") == _ref.width
+      and _res["meta"]["height"] == _ref.height,
+      repr(None if _ref is None else _ref.size))
+check("handler forwards face_anchor / face_strength per job",
+      seen.get("anchor") == 0.65 and seen.get("strength") == 1.0,
+      f"{seen.get('anchor')} / {seen.get('strength')}")
+check("reference is RGB", _ref is not None and _ref.mode == "RGB",
+      repr(None if _ref is None else _ref.mode))
 
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 sys.exit(1 if FAIL else 0)

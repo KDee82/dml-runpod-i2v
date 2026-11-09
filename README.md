@@ -49,13 +49,16 @@ with GFPGAN and pasted back inside a feathered mask — only the face boxes chan
 the rest of the frame is byte-identical. Motion, identity and framing are
 untouched; this repairs structure, it does not add resolution.
 
-Every frame after the first usable one is additionally pulled onto that
-frame's canonical aligned face (temporal identity anchor): the first face
-crop is warped back into each later frame's face position through
-facexlib's affine matrices and blended inside a feathered face oval, so
-GFPGAN's per-frame normalization cannot invent a different person late in
-the shot. `meta.face_restore` reports `restored / anchored / anchor_frame /
-anchor_weight / errors` in every job.
+The uploaded **reference photo** is the identity anchor: before the frame
+loop it goes through the same facexlib/GFPGAN pass, and its largest usable
+face crop becomes canonical. Every generated frame with a usable face —
+frame 0 included — is warped onto that crop through the frame's own affine
+matrix and blended inside a feathered face oval at `FACE_ANCHOR`, so neither
+Wan nor GFPGAN's per-frame normalization can invent a different person. If
+the reference has no usable face (absent, too small, or the restore raises),
+the first generated usable frame seeds the anchor as before. `meta.face_restore`
+reports `restored / anchored / anchor_frame / anchor_source / anchor_weight /
+errors` in every job; `anchor_source` is `"reference"`, `"first_frame"` or null.
 
 | Env | Default | Meaning |
 | --- | --- | --- |
@@ -94,16 +97,17 @@ zero and purges the queue in one call.
 
 | Thing | Value |
 |---|---|
-| Image | `ghcr.io/kdee82/dml-runpod-i2v:1.1.0` (torch 2.6.0+cu124, diffusers 0.42) |
-| Template | `ryrxfhm69b` — boots `handler.py` from this repo at container start |
-| Endpoint | `re69tvql9fj1m4` (`DML-Motion-Studio-I2V-v4`), RTX 4090, `workersMin: 0` |
+| Image | `ghcr.io/kdee82/dml-i2v-face:1.2.2` (torch 2.6.0+cu121, diffusers 0.35+) |
+| Template | `ryrxfhm69b` / v5 template — image CMD runs `/app/handler.py` |
+| Endpoint | `re69tvql9fj1m4` (`DML-Motion-Studio-I2V-v4`) → v5 endpoint with 1.2.2 |
 | Registry auth | Runpod GraphQL `saveRegistryAuth` → `ghcr-kdee82` (REST has no such route) |
 
 **Verified render:** 832×480, 57 frames, 1.9 s, 114 s GPU execution.
 
-Hot-loading the handler means prompt/model/memory changes need only a
-`git push` — the next cold start picks them up. Only dependency or torch
-changes require a rebuild.
+`handler.py` is **baked into the image** (`COPY handler.py /app/handler.py`);
+a `git push` alone does not change a running endpoint. Any handler change
+needs a new image tag + template + endpoint (or a command that hot-loads the
+file). Only then update the studio's `RUNPOD_ENDPOINT_ID`.
 
 ## Traps that cost real debugging time
 
